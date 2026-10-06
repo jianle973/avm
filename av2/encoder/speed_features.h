@@ -562,6 +562,22 @@ typedef struct MV_SPEED_FEATURES {
   //   K: search ref_mv_idx 0..K-1, reuse for ref_mv_idx >= K.
   int newmv_drl_search_limit;
 
+  // Predictively reuse non-AMVD compound NEWMV search results (NEW_NEWMV,
+  // NEAR_NEWMV, NEW_NEARMV and their OPTFLOW variants) across the DRL. A
+  // previous search is reused when it started from the same MV(s), with the
+  // same fixed NEARMV, and its NEWMV-side reference MVs were within one full
+  // pel of the current ones.
+  //   0: off
+  //   1: on
+  int comp_predict_repeated_newmv;
+
+  // Cap the DRL depth that runs a fresh compound NEWMV motion search; beyond
+  // the cap, reuse the nearest searched result that started from the same
+  // MV(s), regardless of the reference MV and NEARMV distances.
+  //   0: off (no cap).
+  //   K: search ref_mv_idx[0] 0..K-1, reuse for ref_mv_idx[0] >= K.
+  int comp_newmv_drl_search_limit;
+
   // Prune mesh search.
   int prune_mesh_search;
 

@@ -488,6 +488,11 @@ static void set_good_speed_features_framesize_independent(
       // motion vector predictor diversity and mitigating coding loss.
       sf->mv_sf.newmv_drl_search_limit = 2;
     }
+    // Predictive compound NEWMV reuse across the DRL.
+    sf->mv_sf.comp_predict_repeated_newmv = 1;
+    // Cap the DRL depth for a fresh compound NEWMV search; reuse the nearest
+    // searched result beyond the cap.
+    sf->mv_sf.comp_newmv_drl_search_limit = boosted ? 2 : 1;
     sf->inter_sf.enable_fast_bawp = 1;
 
     sf->intra_sf.prune_palette_search_level = 1;
@@ -889,6 +894,8 @@ static AVM_INLINE void init_mv_sf(MV_SPEED_FEATURES *mv_sf) {
   mv_sf->skip_second_best_subpel = 0;
   mv_sf->predict_repeated_newmv = 0;
   mv_sf->newmv_drl_search_limit = 0;
+  mv_sf->comp_predict_repeated_newmv = 0;
+  mv_sf->comp_newmv_drl_search_limit = 0;
   mv_sf->search_method = NSTEP;
   mv_sf->simple_motion_subpel_force_stop = EIGHTH_PEL;
   mv_sf->subpel_force_stop = EIGHTH_PEL;
