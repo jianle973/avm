@@ -1179,6 +1179,295 @@ static INLINE int reuse_comp_mv_for_opfl(const AV2_COMMON *const cm,
   return 0;
 }
 
+#if P3_EXP
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct {
+  int init;
+  int depth, modes, dry;
+  long long n_search[3];
+  double t_search[3];
+  long long n_hit[3][3];   // [tier][cls]
+  long long n_same[3][3];  // dry run: search result equals the reused one
+  double t_hit[3][3];      // dry run: time of searches that would be skipped
+  long long n_inval[3];
+  long long n_full;
+  unsigned long long tsc0;
+  struct avm_usec_timer timer;
+} P3Exp;
+static P3Exp p3x;
+static int p3_last_tier;
+static void p3_print(void) {
+  static const char *names[3] = { "NEW_NEW", "NEAR_NEW", "NEW_NEAR" };
+  avm_usec_timer_mark(&p3x.timer);
+  const double us = (double)avm_usec_timer_elapsed(&p3x.timer);
+  const double hz =
+      us > 0 ? (double)(__builtin_ia32_rdtsc() - p3x.tsc0) * 1e6 / us : 1e9;
+  fprintf(stderr, "P3STATS cfg depth=%d modes=%d dry=%d full=%lld hz=%.0f\n",
+          p3x.depth, p3x.modes, p3x.dry, p3x.n_full, hz);
+  for (int c = 0; c < 3; ++c) {
+    fprintf(stderr,
+            "P3STATS %s search=%lld t_search=%.3f hit1=%lld hit2=%lld "
+            "same1=%lld same2=%lld t_hit1=%.3f t_hit2=%.3f inval=%lld\n",
+            names[c], p3x.n_search[c], p3x.t_search[c] / hz, p3x.n_hit[1][c],
+            p3x.n_hit[2][c], p3x.n_same[1][c], p3x.n_same[2][c],
+            p3x.t_hit[1][c] / hz, p3x.t_hit[2][c] / hz, p3x.n_inval[c]);
+  }
+}
+static int p3_env(const char *name, int def) {
+  const char *s = getenv(name);
+  return s ? atoi(s) : def;
+}
+static void p3_init(void) {
+  if (p3x.init) return;
+  p3x.init = 1;
+  p3x.depth = p3_env("P3_DEPTH", 0);
+  p3x.modes = p3_env("P3_MODES", 7);
+  p3x.dry = p3_env("P3_DRY", 0);
+  p3x.tsc0 = __builtin_ia32_rdtsc();
+  avm_usec_timer_start(&p3x.timer);
+  atexit(p3_print);
+}
+// TSC cycles; converted to seconds in p3_print().
+static double p3_now(void) { return (double)__builtin_ia32_rdtsc(); }
+#endif  // P3_EXP
+
+// Returns a bitmask of the motion-searched sides of a non-joint compound
+// NEWMV mode: bit i is set when mv[i] is a NEWMV component and clear when it
+// is a fixed NEARMV. Returns 0 for any other mode.
+static INLINE int get_comp_newmv_search_sides(PREDICTION_MODE mode) {
+  switch (mode) {
+    case NEW_NEWMV:
+    case NEW_NEWMV_OPTFLOW: return 3;
+    case NEAR_NEWMV:
+    case NEAR_NEWMV_OPTFLOW: return 2;
+    case NEW_NEARMV:
+    case NEW_NEARMV_OPTFLOW: return 1;
+    default: return 0;
+  }
+}
+
+// The OPTFLOW compound modes run the same motion search as their non-OPTFLOW
+// counterparts (see also reuse_comp_mv_for_opfl()).
+static INLINE PREDICTION_MODE get_comp_newmv_search_mode(PREDICTION_MODE mode) {
+  switch (mode) {
+    case NEW_NEWMV_OPTFLOW: return NEW_NEWMV;
+    case NEAR_NEWMV_OPTFLOW: return NEAR_NEWMV;
+    case NEW_NEARMV_OPTFLOW: return NEW_NEARMV;
+    default: return mode;
+  }
+}
+
+static INLINE int comp_newmv_reuse_enabled(const SPEED_FEATURES *const sf) {
+  return sf->mv_sf.comp_predict_repeated_newmv ||
+         sf->mv_sf.comp_newmv_drl_search_limit > 0;
+}
+
+// Whether the compound NEWMV search of the current block can be cached and
+// reused: non-joint, non-AMVD and COMPOUND_AVERAGE.
+static INLINE int is_comp_newmv_search_reusable(const MB_MODE_INFO *mbmi) {
+  return !mbmi->use_amvd && get_comp_newmv_search_sides(mbmi->mode) &&
+         mbmi->interinter_comp.type == COMPOUND_AVERAGE;
+}
+
+static INLINE int get_mv_chebyshev_dist(const MV a, const MV b) {
+  return AVMMAX(abs(a.row - b.row), abs(a.col - b.col));
+}
+
+// Records a fresh compound NEWMV search started from start_mv, so that later
+// DRL candidates of the same block can reuse it.
+static INLINE void record_comp_newmv_search(MACROBLOCK *const x,
+                                            HandleInterModeArgs *const args,
+                                            const int_mv *start_mv,
+                                            const int_mv *cur_mv) {
+  const MB_MODE_INFO *const mbmi = x->e_mbd.mi[0];
+  if (!is_comp_newmv_search_reusable(mbmi)) return;
+  if (args->comp_newmv_search_stats_idx >= MAX_COMP_MV_STATS) {
+#if P3_EXP
+    p3x.n_full++;
+#endif
+    return;
+  }
+  COMP_NEWMV_SEARCH_STATS *const st =
+      &args->comp_newmv_search_stats[args->comp_newmv_search_stats_idx++];
+  st->ref_frame_type = av2_ref_frame_type(mbmi->ref_frame);
+  st->mode = get_comp_newmv_search_mode(mbmi->mode);
+  st->mv_precision = mbmi->pb_mv_precision;
+  st->cwp_idx = mbmi->cwp_idx;
+  for (int i = 0; i < 2; ++i) {
+    st->start_mv[i] = start_mv[i];
+    st->ref_mv[i] = av2_get_ref_mv(x, i);
+    st->mv[i] = cur_mv[i];
+  }
+}
+
+// Predictive compound NEWMV reuse across the DRL. cur_mv holds the search
+// start MV on the NEWMV side(s) and the fixed MV on the NEARMV side. A
+// previous fresh search of the same block is a candidate when it has the
+// same reference frames, mode, MV precision and CWP weight, and the same
+// start MV on every NEWMV side. Two triggers select a candidate:
+//   Tier 1 (comp_predict_repeated_newmv): same fixed NEARMV and NEWMV-side
+//     reference MVs within one full pel;
+//   Tier 2 (comp_newmv_drl_search_limit): once ref_mv_idx[0] reaches the
+//     limit, the nearest candidate (closest NEARMV first, then closest
+//     reference MVs) regardless of distance.
+// On success, writes the reused NEWMV-side MV(s) into cur_mv and the MV rate
+// into rate_mv, and returns 1.
+static int reuse_comp_newmv_search(const AV2_COMP *const cpi,
+                                   MACROBLOCK *const x,
+                                   const HandleInterModeArgs *const args,
+                                   int_mv *cur_mv, int *rate_mv) {
+  const MB_MODE_INFO *const mbmi = x->e_mbd.mi[0];
+  const int t1_active = cpi->sf.mv_sf.comp_predict_repeated_newmv != 0;
+  const int drl_limit = cpi->sf.mv_sf.comp_newmv_drl_search_limit;
+#if P3_EXP
+  p3_last_tier = 0;
+  const int depth =
+      p3x.depth ? AVMMAX(get_ref_mv_idx(mbmi, 0), get_ref_mv_idx(mbmi, 1))
+                : mbmi->ref_mv_idx[0];
+  const int t2_active = drl_limit > 0 && depth >= drl_limit;
+  {
+    const int s = get_comp_newmv_search_sides(mbmi->mode);
+    const int bit = s == 3 ? 1 : (s == 2 ? 2 : (s == 1 ? 4 : 0));
+    if (!(p3x.modes & bit)) return 0;
+  }
+#else
+  const int t2_active = drl_limit > 0 && mbmi->ref_mv_idx[0] >= drl_limit;
+#endif
+  if (!(t1_active || t2_active) || !is_comp_newmv_search_reusable(mbmi))
+    return 0;
+
+  const int sides = get_comp_newmv_search_sides(mbmi->mode);
+  const int8_t ref_frame_type = av2_ref_frame_type(mbmi->ref_frame);
+  const PREDICTION_MODE mode = get_comp_newmv_search_mode(mbmi->mode);
+  const MvSubpelPrecision precision = mbmi->pb_mv_precision;
+  const int_mv ref_mv[2] = { av2_get_ref_mv(x, 0), av2_get_ref_mv(x, 1) };
+
+  int best_match = -1;
+  int best_near_diff = INT_MAX;
+  int best_ref_diff = INT_MAX;
+  for (int k = 0; k < args->comp_newmv_search_stats_idx; ++k) {
+    const COMP_NEWMV_SEARCH_STATS *const st = &args->comp_newmv_search_stats[k];
+    if (st->ref_frame_type != ref_frame_type || st->mode != mode ||
+        st->mv_precision != precision || st->cwp_idx != mbmi->cwp_idx)
+      continue;
+    int same_start = 1;
+    int near_diff = 0;
+    int ref_diff = 0;
+    for (int i = 0; i < 2; ++i) {
+      if (sides & (1 << i)) {
+        same_start &= st->start_mv[i].as_int == cur_mv[i].as_int;
+        ref_diff = AVMMAX(ref_diff, get_mv_chebyshev_dist(st->ref_mv[i].as_mv,
+                                                          ref_mv[i].as_mv));
+      } else {
+        near_diff =
+            get_mv_chebyshev_dist(st->start_mv[i].as_mv, cur_mv[i].as_mv);
+      }
+    }
+    if (!same_start) continue;
+    // Tier 1 match: within one full pel -- (1 << 3) in 1/8-pel units.
+    const int t1_match = near_diff == 0 && ref_diff <= (1 << 3);
+    if (!t1_match && !t2_active) continue;
+    if (near_diff < best_near_diff ||
+        (near_diff == best_near_diff && ref_diff < best_ref_diff)) {
+      best_match = k;
+      best_near_diff = near_diff;
+      best_ref_diff = ref_diff;
+    }
+  }
+  if (best_match < 0) return 0;
+#if P3_EXP
+  p3_last_tier = (best_near_diff == 0 && best_ref_diff <= (1 << 3)) ? 1 : 2;
+#endif
+
+  // The reused MVs were searched against other reference MVs, so check that
+  // they are valid for the current ones: in range, with an MVD representable
+  // at the current precision (otherwise the decoder would reconstruct a
+  // different MV) and nonzero (a zero MVD is rejected for NEWMV sides).
+  const COMP_NEWMV_SEARCH_STATS *const st =
+      &args->comp_newmv_search_stats[best_match];
+  int rate = 0;
+  for (int i = 0; i < 2; ++i) {
+    if (!(sides & (1 << i))) continue;
+    const MV mv = st->mv[i].as_mv;
+    SubpelMvLimits mv_limits;
+    av2_set_subpel_mv_search_range(&mv_limits, &x->mv_limits, &ref_mv[i].as_mv,
+                                   precision);
+    MV mvd;
+    get_mvd_from_ref_mv(mv, ref_mv[i].as_mv, 0, precision, &mvd);
+    if (st->mv[i].as_int == ref_mv[i].as_int ||
+        !av2_is_subpelmv_in_range(&mv_limits, mv) ||
+        !is_this_mv_precision_compliant(mvd, precision)) {
+#if P3_EXP
+      p3x.n_inval[sides == 3 ? 0 : (sides == 2 ? 1 : 2)]++;
+      p3_last_tier = 0;
+#endif
+      return 0;
+    }
+    rate += av2_mv_bit_cost(&mv, &ref_mv[i].as_mv, precision, &x->mv_costs,
+                            MV_COST_WEIGHT, 0);
+  }
+  for (int i = 0; i < 2; ++i) {
+    if (sides & (1 << i)) cur_mv[i] = st->mv[i];
+  }
+  *rate_mv = rate;
+  return 1;
+}
+
+// Runs the compound NEWMV motion search of a NEW_NEWMV, NEAR_NEWMV or
+// NEW_NEARMV mode (or an OPTFLOW variant) starting from cur_mv, unless an
+// equivalent earlier search can be reused (see reuse_comp_newmv_search()).
+static void comp_newmv_motion_search(const AV2_COMP *const cpi,
+                                     MACROBLOCK *const x, BLOCK_SIZE bsize,
+                                     int_mv *cur_mv, int *rate_mv,
+                                     HandleInterModeArgs *const args) {
+  const MB_MODE_INFO *const mbmi = x->e_mbd.mi[0];
+  const int sides = get_comp_newmv_search_sides(mbmi->mode);
+  assert(sides);
+  const int reuse_enabled = comp_newmv_reuse_enabled(&cpi->sf);
+#if P3_EXP
+  p3_init();
+  const int cls = sides == 3 ? 0 : (sides == 2 ? 1 : 2);
+  int_mv reuse_mv[2] = { cur_mv[0], cur_mv[1] };
+  int reuse_rate = 0;
+  const int reused =
+      reuse_enabled && reuse_comp_newmv_search(cpi, x, args, reuse_mv,
+                                               &reuse_rate);
+  const int tier = reused ? p3_last_tier : 0;
+  if (reused) p3x.n_hit[tier][cls]++;
+  if (reused && !p3x.dry) {
+    cur_mv[0] = reuse_mv[0];
+    cur_mv[1] = reuse_mv[1];
+    *rate_mv = reuse_rate;
+    return;
+  }
+  const double t0 = p3_now();
+#else
+  if (reuse_enabled && reuse_comp_newmv_search(cpi, x, args, cur_mv, rate_mv))
+    return;
+#endif
+  const int_mv start_mv[2] = { cur_mv[0], cur_mv[1] };
+  if (sides == 3) {
+    av2_joint_motion_search(cpi, x, bsize, cur_mv, NULL, 0, rate_mv);
+  } else {
+    const int ref_idx = sides == 2;
+    av2_compound_single_motion_search_interinter(cpi, x, bsize, cur_mv, NULL,
+                                                 0, rate_mv, ref_idx);
+  }
+#if P3_EXP
+  const double dt = p3_now() - t0;
+  p3x.n_search[cls]++;
+  p3x.t_search[cls] += dt;
+  if (reused) {
+    p3x.t_hit[tier][cls] += dt;
+    if (reuse_mv[0].as_int == cur_mv[0].as_int &&
+        reuse_mv[1].as_int == cur_mv[1].as_int)
+      p3x.n_same[tier][cls]++;
+  }
+#endif
+  if (reuse_enabled) record_comp_newmv_search(x, args, start_mv, cur_mv);
+}
+
 static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
                             const BLOCK_SIZE bsize, int_mv *cur_mv,
                             int *const rate_mv, HandleInterModeArgs *const args,
@@ -1254,7 +1543,7 @@ static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
             av2_amvd_joint_motion_search(cpi, x, bsize, cur_mv, NULL, 0,
                                          rate_mv);
           else
-            av2_joint_motion_search(cpi, x, bsize, cur_mv, NULL, 0, rate_mv);
+            comp_newmv_motion_search(cpi, x, bsize, cur_mv, rate_mv, args);
         } else {
           *rate_mv = 0;
           for (int i = 0; i < 2; ++i) {
@@ -1286,8 +1575,7 @@ static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
 
         int_mv start_mv = cur_mv[1];
 
-        av2_compound_single_motion_search_interinter(cpi, x, bsize, cur_mv,
-                                                     NULL, 0, rate_mv, 1);
+        comp_newmv_motion_search(cpi, x, bsize, cur_mv, rate_mv, args);
 
         if (cur_mv->as_int == INVALID_MV) return INT64_MAX;
         save_comp_mv_search_stat(x, args, cur_mv, start_mv);
@@ -1295,8 +1583,7 @@ static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
         // avmenc2
         if (cpi->sf.inter_sf.comp_inter_joint_search_thresh <= bsize ||
             !valid_mv1) {
-          av2_compound_single_motion_search_interinter(cpi, x, bsize, cur_mv,
-                                                       NULL, 0, rate_mv, 1);
+          comp_newmv_motion_search(cpi, x, bsize, cur_mv, rate_mv, args);
         } else {
           const int_mv ref_mv = av2_get_ref_mv(x, 1);
           update_mv_precision(ref_mv.as_mv, pb_mv_precision,
@@ -1358,8 +1645,7 @@ static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
         clamp_mv_in_range(x, &cur_mv[0], 0, pb_mv_precision);
       }
       if (enable_amvd_compound_search) {
-        av2_compound_single_motion_search_interinter(cpi, x, bsize, cur_mv,
-                                                     NULL, 0, rate_mv, 0);
+        comp_newmv_motion_search(cpi, x, bsize, cur_mv, rate_mv, args);
         if (cur_mv->as_int == INVALID_MV) return INT64_MAX;
         int_mv start_mv = { 0 };
         save_comp_mv_search_stat(x, args, cur_mv, start_mv);
@@ -1367,8 +1653,7 @@ static int64_t handle_newmv(const AV2_COMP *const cpi, MACROBLOCK *const x,
         // avmenc3
         if (cpi->sf.inter_sf.comp_inter_joint_search_thresh <= bsize ||
             !valid_mv0) {
-          av2_compound_single_motion_search_interinter(cpi, x, bsize, cur_mv,
-                                                       NULL, 0, rate_mv, 0);
+          comp_newmv_motion_search(cpi, x, bsize, cur_mv, rate_mv, args);
         } else {
           const int_mv ref_mv = av2_get_ref_mv(x, 0);
           update_mv_precision(ref_mv.as_mv, pb_mv_precision, &cur_mv[0].as_mv);
@@ -4943,6 +5228,9 @@ static AVM_INLINE int needs_comp_type_eval(const AV2_COMP *cpi,
 // This function performs the core RD evaluation for a given predictor,
 // including interpolation filter search, motion mode search, and updating
 // the best search state.
+#if P3_EXP
+#define evaluate_inter_predictor evaluate_inter_predictor_impl
+#endif
 static void evaluate_inter_predictor(AV2_COMP *const cpi,
                                      TileDataEnc *tile_data, MACROBLOCK *x,
                                      const PredictorSearchEnv *env,
@@ -9506,6 +9794,8 @@ void av2_rd_pick_inter_mode_sb(struct AV2_COMP *cpi,
     0,
     interintra_modes,
     { { 0, { { 0 } }, { 0 }, 0, 0, 0 } },
+    0,
+    { { 0 } },
     0,
     { { 0 } },
     0,

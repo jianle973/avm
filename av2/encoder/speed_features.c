@@ -11,6 +11,9 @@
  */
 
 #include <limits.h>
+#if P3_EXP
+#include <stdlib.h>
+#endif
 
 #include "av2/common/reconintra.h"
 
@@ -889,6 +892,8 @@ static AVM_INLINE void init_mv_sf(MV_SPEED_FEATURES *mv_sf) {
   mv_sf->skip_second_best_subpel = 0;
   mv_sf->predict_repeated_newmv = 0;
   mv_sf->newmv_drl_search_limit = 0;
+  mv_sf->comp_predict_repeated_newmv = 0;
+  mv_sf->comp_newmv_drl_search_limit = 0;
   mv_sf->search_method = NSTEP;
   mv_sf->simple_motion_subpel_force_stop = EIGHTH_PEL;
   mv_sf->subpel_force_stop = EIGHTH_PEL;
@@ -1374,6 +1379,17 @@ void av2_set_speed_features_framesize_independent(AV2_COMP *cpi, int speed) {
   } else if (oxcf->mode == REALTIME) {
     set_rt_speed_features_framesize_independent(cpi, sf, speed);
   }
+#if P3_EXP
+  {
+    const char *s;
+    if ((s = getenv("P3_T1")) != NULL)
+      sf->mv_sf.comp_predict_repeated_newmv = atoi(s);
+    if ((s = getenv("P3_K")) != NULL)
+      sf->mv_sf.comp_newmv_drl_search_limit = atoi(s);
+    if ((s = getenv("P3_KB")) != NULL && frame_is_boosted(cpi))
+      sf->mv_sf.comp_newmv_drl_search_limit = atoi(s);
+  }
+#endif
 
   if (oxcf->mode == GOOD && cpi->oxcf.enable_low_complexity_decode) {
     // TODO (yunqingwang): LC speed features are added below.

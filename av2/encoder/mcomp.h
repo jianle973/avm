@@ -462,6 +462,24 @@ typedef struct {
   int_mv mv[2];
 } JOINT_AMVDNEWMV_STATS;
 
+// A fresh non-AMVD compound NEWMV motion search (NEW_NEWMV, NEAR_NEWMV or
+// NEW_NEARMV, and their OPTFLOW variants), kept so that a later DRL candidate
+// of the same block with an equivalent search problem can reuse its result.
+typedef struct {
+  int8_t ref_frame_type;
+  // Mode with the OPTFLOW variants folded into the non-OPTFLOW mode, as both
+  // run the same motion search.
+  PREDICTION_MODE mode;
+  MvSubpelPrecision mv_precision;
+  int8_t cwp_idx;
+  // NEWMV side: search start MV. NEARMV side: the fixed MV.
+  int_mv start_mv[2];
+  // Reference MVs; only meaningful on the NEWMV side(s).
+  int_mv ref_mv[2];
+  // Search result.
+  int_mv mv[2];
+} COMP_NEWMV_SEARCH_STATS;
+
 int opfl_refine_fullpel_mv_one_sided(
     const AV2_COMMON *cm, MACROBLOCKD *xd,
     const FULLPEL_MOTION_SEARCH_PARAMS *ms_params, MB_MODE_INFO *mbmi,

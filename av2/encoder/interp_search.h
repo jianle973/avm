@@ -203,6 +203,16 @@ typedef struct {
   NEAR_NEWMV_AMVD_STATS near_newmv_amvd_stats[MAX_COMP_MV_STATS];
   int near_newmv_amvd_stats_idx;
 
+  /*!
+   * Fresh non-AMVD compound NEWMV motion searches of the current block, for
+   * reuse across DRL candidates with an equivalent search problem.
+   */
+  COMP_NEWMV_SEARCH_STATS comp_newmv_search_stats[MAX_COMP_MV_STATS];
+  /*!
+   * Number of valid entries in comp_newmv_search_stats.
+   */
+  int comp_newmv_search_stats_idx;
+
   /*! \brief Dry-pass caps, or NULL outside a dry pass. */
   const DryPassCfg *dry_pass_cfg;
 } HandleInterModeArgs;
