@@ -3488,7 +3488,6 @@ typedef struct RdResults {
   int utilization;
   int64_t total_distortion;
   int64_t total_bits;
-  int64_t total_stat_distortion;
   int64_t total_sse;
   double total_cost;
 } RdResults;
@@ -3641,7 +3640,6 @@ static void compute_unit_errors_mt(const RestSearchCtxt *rsc,
 static RdResults update_cost_and_weights_wienerns(RestSearchCtxt *rsc,
                                                   RestorationUnitInfo *rui,
                                                   double *work_cost_array,
-                                                  int fill_stat_distortion,
                                                   int use_stat_distortion) {
   const WienernsFilterParameters *nsfilter_params = get_wienerns_parameters(
       rsc->cm->quant_params.base_qindex, rsc->plane != AVM_PLANE_Y);
@@ -3694,22 +3692,11 @@ static RdResults update_cost_and_weights_wienerns(RestSearchCtxt *rsc,
       results.utilization++;
       results.total_cost += cost_wienerns;
       unit_stats_ptr->weight = RU_ON_WEIGHT;
-
-      if (fill_stat_distortion) {
-        const double scaled_distortion = get_scaled_filter_distortion(
-            unit_stats_ptr, &rui->wienerns_info, num_feat, tap_qstep);
-        results.total_stat_distortion +=
-            ROUND_POWER_OF_TWO((int64_t)scaled_distortion, 2 * tap_shift);
-      }
     } else {
       results.total_distortion += distortion_none;
       results.total_bits += bits_none;
       results.total_cost += cost_none;
       unit_stats_ptr->weight = RU_OFF_WEIGHT;
-
-      if (fill_stat_distortion) {
-        results.total_stat_distortion += distortion_none;
-      }
     }
     results.total_sse += distortion_none;
   }
@@ -3731,7 +3718,7 @@ static double obtain_temp_pred_frame_filters_cost(RestSearchCtxt *rsc,
 
   rui.wienerns_info = *filter;
   RdResults rd_results =
-      update_cost_and_weights_wienerns(rsc, &rui, work_cost_array, 0, 0);
+      update_cost_and_weights_wienerns(rsc, &rui, work_cost_array, 0);
 
   double cost = RDCOST_DBL_WITH_NATIVE_BD_DIST(
       rsc->x->rdmult, rd_results.total_bits >> 4, rd_results.total_distortion,
@@ -3793,7 +3780,7 @@ static double optimize_frame_filters_for_target_classes(
       solve_filters_from_stats_wienerns(rsc, &sum_stats, &tmp_filter);
       rui.wienerns_info = tmp_filter;
       RdResults iter_rd_results = update_cost_and_weights_wienerns(
-          rsc, &rui, work_cost_array, 1, use_stat_distortion);
+          rsc, &rui, work_cost_array, use_stat_distortion);
       if (iter_rd_results.total_distortion == rd_results.total_distortion &&
           iter_rd_results.total_bits == rd_results.total_bits)
         break;
@@ -3919,7 +3906,7 @@ static double optimize_frame_filters_with_rounding(
                              1, &tmp_bank, ALL_WIENERNS_CLASSES);
   *best_filter = rui.wienerns_info;
   RdResults rd_results =
-      update_cost_and_weights_wienerns(rsc, &rui, cost_array, 0, 0);
+      update_cost_and_weights_wienerns(rsc, &rui, cost_array, 0);
   initialize_bank_with_best_frame_filter_match(rsc, best_filter, &tmp_bank, 1);
   double cost = RDCOST_DBL_WITH_NATIVE_BD_DIST(
       rsc->x->rdmult, rd_results.total_bits >> 4, rd_results.total_distortion,

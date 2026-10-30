@@ -499,8 +499,17 @@ static void cdef_search_filter_block(const CdefSearchCtx *ctx,
   const int yoff = CDEF_VBORDER * (fbr != 0);
   const int xoff = CDEF_HBORDER * (fbc != 0);
   int dirinit = 0;
+  // Away from the frame edges the copy below fills every pixel the filter
+  // reads (rows [-CDEF_VBORDER, v + CDEF_VBORDER), columns
+  // [-CDEF_HBORDER, h + CDEF_HBORDER)), so only the blocks on a frame edge
+  // need the CDEF_VERY_LARGE padding.
+  const int on_frame_edge = fbr == 0 || fbc == 0 ||
+                            fbr + job->vb_step >= nvfb ||
+                            fbc + job->hb_step >= nhfb;
   for (int pli = 0; pli < ctx->num_planes; pli++) {
-    for (int i = 0; i < CDEF_INBUF_SIZE; i++) inbuf[i] = CDEF_VERY_LARGE;
+    if (on_frame_edge) {
+      for (int i = 0; i < CDEF_INBUF_SIZE; i++) inbuf[i] = CDEF_VERY_LARGE;
+    }
     /* We avoid filtering the pixels for which some of the pixels to
        average are outside the frame. We could change the filter instead,
        but it would add special cases for any future vectorization. */

@@ -130,12 +130,15 @@ static INLINE int get_df_luma_offset_bits(const int vert_offset,
          get_df_offset_bits(horz_offset, vert_offset, df_par_bits);
 }
 
+// err_cache, if not NULL, holds MAX_DF_OFFSETS + 1 SSE values (-1 when not
+// evaluated yet) indexed by offset + ZERO_DF_OFFSET. It lets several searches
+// of the same filter configuration share their trials.
 static int search_filter_offsets(
     const YV12_BUFFER_CONFIG *sd, AV2_COMP *cpi, int partial_frame,
     const int last_frame_q_offsets[MAX_MB_PLANE][NUM_EDGE_DIRS],
     const int last_frame_side_offsets[MAX_MB_PLANE][NUM_EDGE_DIRS],
     double *best_cost_ret, int plane, int search_side_offset, int dir,
-    int64_t *best_filter_sse, int64_t known_start_err) {
+    int64_t *best_filter_sse, int64_t known_start_err, int64_t *err_cache) {
   const AV2_COMMON *const cm = &cpi->common;
   MACROBLOCK *x = &cpi->td.mb;
   const uint8_t df_par_bits = cm->seq_params.df_par_bits_minus2 + 2;
@@ -174,8 +177,11 @@ static int search_filter_offsets(
   int filter_step = DF_SEARCH_STEP_SIZE;
 
   // Sum squared error at each filter level
-  int64_t ss_err[MAX_DF_OFFSETS + 1];
-  memset(ss_err, 0xFF, sizeof(ss_err));  // Set each entry to -1
+  int64_t local_ss_err[MAX_DF_OFFSETS + 1];
+  int64_t *const ss_err = err_cache ? err_cache : local_ss_err;
+  if (!err_cache) {
+    memset(local_ss_err, 0xFF, sizeof(local_ss_err));  // Set each entry to -1
+  }
 
   if (known_start_err >= 0) {
     // The caller already evaluated this exact filter configuration, and
@@ -369,7 +375,7 @@ void av2_pick_filter_level(const YV12_BUFFER_CONFIG *sd, AV2_COMP *cpi,
         sd, cpi, method == LPF_PICK_FROM_SUBIMAGE, last_frame_delta_q,
         last_frame_delta_side, &best_single_cost, AVM_PLANE_Y,
         search_side_offset, /*dir=*/2, &best_single_sse,
-        /*known_start_err=*/-1);
+        /*known_start_err=*/-1, /*err_cache=*/NULL);
     for (EDGE_DIR dir = VERT_EDGE; dir < NUM_EDGE_DIRS; ++dir) {
       last_frame_delta_side[AVM_PLANE_Y][dir] = offset;
       lf->delta_side_luma[dir] = offset;
@@ -391,7 +397,8 @@ void av2_pick_filter_level(const YV12_BUFFER_CONFIG *sd, AV2_COMP *cpi,
       offset = search_filter_offsets(
           sd, cpi, method == LPF_PICK_FROM_SUBIMAGE, last_frame_delta_q,
           last_frame_delta_side, &best_dual_cost, AVM_PLANE_Y,
-          search_side_offset, dir, &best_dual_sse, known_start_err);
+          search_side_offset, dir, &best_dual_sse, known_start_err,
+          /*err_cache=*/NULL);
       last_frame_delta_side[AVM_PLANE_Y][dir] = offset;
       lf->delta_side_luma[dir] = offset;
 
@@ -448,6 +455,11 @@ void av2_pick_filter_level(const YV12_BUFFER_CONFIG *sd, AV2_COMP *cpi,
         zero_filter_sse[plane] = no_deblocking_sse;
         no_deblocking_cost[plane] = RDCOST_DBL_WITH_NATIVE_BD_DIST(
             cpi->td.mb.rdmult, 0, no_deblocking_sse, bit_depth);
+        // Both passes filter only this plane, with the q and side offsets set
+        // to the same value, and restore it after every trial. So the SSE of
+        // an offset is the same in both passes and they can share trials.
+        int64_t chroma_ss_err[MAX_DF_OFFSETS + 1];
+        memset(chroma_ss_err, 0xFF, sizeof(chroma_ss_err));  // all -1
         for (int pass = 0; pass < 2; ++pass) {
           // Pass 1 starts from the offset returned by pass 0, whose SSE is
           // already in best_filter_sse[plane].
@@ -457,7 +469,7 @@ void av2_pick_filter_level(const YV12_BUFFER_CONFIG *sd, AV2_COMP *cpi,
               sd, cpi, method == LPF_PICK_FROM_SUBIMAGE, last_frame_delta_q,
               last_frame_delta_side, &best_cost[plane], plane,
               search_side_offset, dir, &best_filter_sse[plane],
-              known_start_err);
+              known_start_err, chroma_ss_err);
           last_frame_delta_side[plane][0] = offset;
           *delta_side[plane] = offset;
           last_frame_delta_q[plane][0] = offset;
@@ -536,7 +548,9 @@ static AVM_INLINE double get_tip_frame_filter_cost(
   return filter_cost;
 }
 
-// Try deblocking filter on TIP frame with a given filter strength.
+// Try deblocking filter on TIP frame with a given filter strength. The TIP
+// frame is left filtered; the caller restores it from cpi->last_frame_uf if
+// needed.
 static double try_filter_tip_frame(AV2_COMP *const cpi, int tip_delta,
                                    int num_planes) {
   AV2_COMMON *const cm = &cpi->common;
@@ -548,18 +562,14 @@ static double try_filter_tip_frame(AV2_COMP *const cpi, int tip_delta,
   init_tip_lf_parameter(cm, AVM_PLANE_Y, num_planes);
   av2_enc_loop_filter_tip_frame(cpi, AVM_PLANE_Y, num_planes);
 
-  double filter_cost = get_tip_frame_filter_cost(
-      cpi, cpi->source, tip_frame_buf, /*bits=*/3, td->mb.rdmult,
-      cm->seq_params.bit_depth, num_planes);
-
-  // Re-instate the unfiltered frame
-  for (int plane = AVM_PLANE_Y; plane < num_planes; ++plane) {
-    yv12_copy_plane(&cpi->last_frame_uf, tip_frame_buf, plane);
-  }
-  return filter_cost;
+  return get_tip_frame_filter_cost(cpi, cpi->source, tip_frame_buf, /*bits=*/3,
+                                   td->mb.rdmult, cm->seq_params.bit_depth,
+                                   num_planes);
 }
 
-// Search deblocking filter strength for TIP frame
+// Search deblocking filter strength for TIP frame. When the filter is
+// enabled, the TIP frame is left filtered with the selected parameters;
+// otherwise it is left unfiltered.
 void search_tip_filter_level(AV2_COMP *cpi, struct AV2Common *cm) {
   YV12_BUFFER_CONFIG *tip_frame_buf = &cm->tip_ref.tip_frame->buf;
   const int num_planes = av2_num_planes(cm);
@@ -580,4 +590,12 @@ void search_tip_filter_level(AV2_COMP *cpi, struct AV2Common *cm) {
       try_filter_tip_frame(cpi, /*tip_delta=*/0, num_planes);
 
   cm->lf.apply_deblocking_filter_tip = best_filter_cost < unfilter_cost;
+
+  // Re-instate the unfiltered frame only when the filter is off. When it is
+  // on, the frame already holds the output of the selected filter.
+  if (!cm->lf.apply_deblocking_filter_tip) {
+    for (int plane = AVM_PLANE_Y; plane < num_planes; ++plane) {
+      yv12_copy_plane(&cpi->last_frame_uf, tip_frame_buf, plane);
+    }
+  }
 }
