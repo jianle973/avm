@@ -2921,61 +2921,76 @@ static void gdf_search_job(const AV2_COMP *cpi, GdfStripeBuf *sb,
           gdf_setup_processing_stripe_leftright_boundary(
               gi, sb, i_min, i_max, j_min, j_max, tile_boundary_left,
               tile_boundary_right);
-          int use_gdf_local =
+          const int use_gdf_local =
               gdf_block_adjust_and_validate(&i_min, &i_max, &j_min, &j_max);
+          // When use_gdf_local is 0 the unit is empty (i_max <= i_min or
+          // j_max <= j_min), so it adds nothing to any error sum.
           if (use_gdf_local) {
             gdf_set_lap_and_cls_unit(
                 i_min, i_max, j_min, j_max,
                 gdf_stripe_ptr(gi, sb, i_min - 1, j_min - 1), gi->inp_stride,
                 bit_depth, sb->lap_ptr, gi->lap_stride, sb->cls_ptr,
                 gi->cls_stride);
-          }
-          for (int qp_idx = qp_idx_start; qp_idx < GDF_RDO_QP_NUM; qp_idx++) {
-            if (use_gdf_local) {
+            const int unit_w = j_max - j_min;
+            // Sums are kept in locals to avoid false sharing with other
+            // threads. A unit row has at most GDF_TEST_STRIPE_SIZE (64)
+            // pixels, each with a squared error below 2^24, so the row sums
+            // fit in 32 bits.
+            // The error of the unfiltered reconstruction does not depend on
+            // the QP candidate, so it is computed once per unit.
+            int64_t rec_err = 0;
+            for (int i = i_min; i < i_max; i++) {
+              const uint16_t *rec_row = rec_pnt + i * rec_stride + j_min;
+              const uint16_t *org_row = org_pnt + i * org_stride + j_min;
+              int32_t row_err = 0;
+              for (int j = 0; j < unit_w; j++) {
+                const int diff = rec_row[j] - org_row[j];
+                row_err += diff * diff;
+              }
+              rec_err += row_err;
+            }
+            rec_pic_error[blk_idx] += rec_err;
+            for (int qp_idx = qp_idx_start; qp_idx < GDF_RDO_QP_NUM;
+                 qp_idx++) {
               gdf_inference_unit(
                   i_min, i_max, j_min, j_max, qp_idx + qp_idx_base,
                   gdf_stripe_ptr(gi, sb, i_min, j_min), gi->inp_stride,
                   sb->lap_ptr, gi->lap_stride, sb->cls_ptr, gi->cls_stride,
                   sb->err_ptr, gi->err_stride, pxl_shift, ref_dst_idx);
-            }
-            // Sum in locals to avoid false sharing with other threads.
-            int64_t rec_err = rec_pic_error[blk_idx];
-            int64_t flg_err[GDF_RDO_SCALE_NUM] = { 0 };
-            for (int i = i_min; i < i_max; i++) {
-              for (int j = j_min; j < j_max; j++) {
-                int rec_loc = i * rec_stride + j;
-                int org_loc = i * org_stride + j;
-                int err_loc = (i - i_min) * gi->err_stride + (j - j_min);
-
-                if (qp_idx == qp_idx_start) {
-                  int64_t tmp_err = rec_pnt[rec_loc] - org_pnt[org_loc];
-                  rec_err += tmp_err * tmp_err;
+              int64_t flg_err[GDF_RDO_SCALE_NUM] = { 0 };
+              for (int i = i_min; i < i_max; i++) {
+                const uint16_t *rec_row = rec_pnt + i * rec_stride + j_min;
+                const uint16_t *org_row = org_pnt + i * org_stride + j_min;
+                const int16_t *err_row =
+                    sb->err_ptr + (i - i_min) * gi->err_stride;
+                int32_t row_err[GDF_RDO_SCALE_NUM] = { 0 };
+                for (int j = 0; j < unit_w; j++) {
+                  // (scale_idx + 1) * err rounded half away from zero, i.e.
+                  // sign(err) * (((scale_idx + 1) * |err| + half) >> shift).
+                  const int neg = -(err_row[j] < 0);
+                  const int abs_err = (err_row[j] ^ neg) - neg;
+                  const int rec = rec_row[j];
+                  const int org = org_row[j];
+                  for (int scale_idx = 0; scale_idx < GDF_RDO_SCALE_NUM;
+                       scale_idx++) {
+                    int val =
+                        ((scale_idx + 1) * abs_err + err_shift_half_pow2) >>
+                        err_shift;
+                    val = (val ^ neg) - neg;
+                    const int diff = CLIP(val + rec, 0, pxl_max) - org;
+                    row_err[scale_idx] += diff * diff;
+                  }
                 }
-
                 for (int scale_idx = 0; scale_idx < GDF_RDO_SCALE_NUM;
                      scale_idx++) {
-                  if (!use_gdf_local) {
-                    flg_err[scale_idx] += rec_err;
-                    continue;
-                  }
-                  int32_t tmp_val = (scale_idx + 1) * sb->err_ptr[err_loc];
-                  if (tmp_val > 0) {
-                    tmp_val = (tmp_val + err_shift_half_pow2) >> err_shift;
-                  } else {
-                    tmp_val =
-                        -(((-tmp_val) + err_shift_half_pow2) >> err_shift);
-                  }
-                  tmp_val = CLIP(tmp_val + rec_pnt[rec_loc], 0, pxl_max) -
-                            org_pnt[org_loc];
-                  flg_err[scale_idx] += (int64_t)tmp_val * tmp_val;
+                  flg_err[scale_idx] += row_err[scale_idx];
                 }
               }
-            }
-            rec_pic_error[blk_idx] = rec_err;
-            for (int scale_idx = 0; scale_idx < GDF_RDO_SCALE_NUM;
-                 scale_idx++) {
-              errors->flg_pic_error[scale_idx][qp_idx][blk_idx] +=
-                  flg_err[scale_idx];
+              for (int scale_idx = 0; scale_idx < GDF_RDO_SCALE_NUM;
+                   scale_idx++) {
+                errors->flg_pic_error[scale_idx][qp_idx][blk_idx] +=
+                    flg_err[scale_idx];
+              }
             }
           }
           gdf_restore_processing_stripe_leftright_boundary(
@@ -3114,17 +3129,15 @@ static void gdf_optimizer(AV2_COMP *cpi, AV2_COMMON *cm, GdfStripeBuf *bufs,
   CHECK_MEM_ERROR(cm, block_ids,
                   (int *)avm_calloc(cm->gdf_info.gdf_block_num, sizeof(int)));
   int ctx_idx = 0, sb_size = cm->mib_size << MI_SIZE_LOG2;
+  // gdf_block_size is a power-of-two multiple of the superblock size (see
+  // init_gdf()), so the only position of a superblock that can start a GDF
+  // block is its top-left corner.
+  assert(cm->gdf_info.gdf_block_size % sb_size == 0);
   for (int y_pos = 0; y_pos < rec_height; y_pos += sb_size) {
     for (int x_pos = 0; x_pos < rec_width; x_pos += sb_size) {
-      for (int v_pos = y_pos; v_pos < y_pos + sb_size && v_pos < rec_height;
-           v_pos += 4) {
-        for (int u_pos = x_pos; u_pos < x_pos + sb_size && u_pos < rec_width;
-             u_pos += 4) {
-          int this_blk_idx = gdf_get_block_idx(cm, v_pos, u_pos);
-          if (this_blk_idx >= 0) {
-            block_ids[ctx_idx++] = this_blk_idx;
-          }
-        }
+      const int this_blk_idx = gdf_get_block_idx(cm, y_pos, x_pos);
+      if (this_blk_idx >= 0) {
+        block_ids[ctx_idx++] = this_blk_idx;
       }
     }
   }
@@ -3507,7 +3520,8 @@ static void cdef_restoration_frame(AV2_COMP *cpi, AV2_COMMON *cm,
 #if CONFIG_MISMATCH_DEBUG
     mismatch_record_frame(&cm->cur_frame->buf, num_planes, 4);
 #endif
-    gdf_free_guided_frame(cm);
+    // The guided frame buffer is kept for the next frame and freed at
+    // teardown.
   }
 
 #if CONFIG_COLLECT_COMPONENT_TIMING
@@ -4283,9 +4297,8 @@ static INLINE int compute_tip_direct_output_mode_RD(AV2_COMP *cpi,
         cm->cur_frame->base_qindex = cm->quant_params.base_qindex =
             avg_base_qindex;
       }
+      // Leaves the TIP frame filtered when the filter is enabled.
       search_tip_filter_level(cpi, cm);
-      init_tip_lf_parameter(cm, 0, av2_num_planes(cm));
-      av2_enc_loop_filter_tip_frame(cpi, 0, av2_num_planes(cm));
       if (cm->seq_params.enable_tip_explicit_qp == 0) {
         cm->cur_frame->u_ac_delta_q = cm->quant_params.u_ac_delta_q =
             u_ac_delta_q_backup;

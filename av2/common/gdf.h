@@ -178,10 +178,11 @@ static inline int gdf_frame_not_filtered(const AV2_COMMON *cm) {
   return cm->bru.frame_inactive_flag || cm->bridge_frame_info.is_bridge_frame;
 }
 
-/*!\brief Function to allocate memory and copy guided frame of GDF
+/*!\brief Function to copy the guided frame of GDF. The buffer is kept across
+ * frames and only made again when it has to grow.
  */
 void gdf_copy_guided_frame(AV2_COMMON *cm);
-/*!\brief Function to free memory for guided frame of GDF
+/*!\brief Function to free memory for guided frame of GDF, at teardown
  */
 void gdf_free_guided_frame(AV2_COMMON *cm);
 

@@ -1277,7 +1277,8 @@ static AVM_INLINE void init_lpf_sf(LOOP_FILTER_SPEED_FEATURES *lpf_sf) {
   lpf_sf->enable_ccso_mt = 1;
   lpf_sf->gdf_prune_qp_cands = 0;
   lpf_sf->ccso_max_band_candidates = 0;
-  lpf_sf->ccso_reuse_bo_class_stats = 0;
+  // Bit-exact: coarser band counts are sums of adjacent fine bins.
+  lpf_sf->ccso_reuse_bo_class_stats = 1;
   lpf_sf->enable_lr_mt = 1;
   lpf_sf->enable_gdf_mt = 1;
 }

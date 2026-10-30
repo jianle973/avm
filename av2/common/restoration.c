@@ -1822,7 +1822,16 @@ void av2_loop_restoration_filter_unit(
 
   const int enable_pcwiener_buffers =
       unit_rtype == RESTORE_PC_WIENER || unit_rtype == RESTORE_WIENER_NONSEP;
-  PcwienerBuffers pc_wiener_buffers = { 0 };
+  // The line buffers are only read by apply_pc_wiener_highbd(): when filtering
+  // with PC-Wiener, or when Wiener-NS needs the multi-class classification.
+  const int alloc_pcwiener_buffers =
+      unit_rtype == RESTORE_PC_WIENER ||
+      (unit_rtype == RESTORE_WIENER_NONSEP && rui->compute_classification &&
+       rui->wienerns_info.num_classes > 1);
+  PcwienerBuffers pc_wiener_buffers;
+  if (alloc_pcwiener_buffers) {
+    memset(&pc_wiener_buffers, 0, sizeof(pc_wiener_buffers));
+  }
   tmp_rui->pcwiener_buffers = &pc_wiener_buffers;
   const uint8_t *tskip_in_ru = NULL;
   uint8_t *wiener_class_id_in_ru = NULL;
@@ -1834,6 +1843,8 @@ void av2_loop_restoration_filter_unit(
         rui->wiener_class_id +
         (limits->v_start >> MI_SIZE_LOG2) * rui->wiener_class_id_stride +
         (limits->h_start >> MI_SIZE_LOG2);
+  }
+  if (alloc_pcwiener_buffers) {
     allocate_pcwiener_line_buffers(procunit_width, tmp_rui->pcwiener_buffers);
   }
 
@@ -1971,7 +1982,7 @@ void av2_loop_restoration_filter_unit(
 
     i += h;
   }
-  if (enable_pcwiener_buffers)
+  if (alloc_pcwiener_buffers)
     free_pcwiener_line_buffers(tmp_rui->pcwiener_buffers);
 }
 
@@ -2098,11 +2109,9 @@ static void foreach_rest_unit_in_planes(AV2LrStruct *lr_ctxt, AV2_COMMON *cm,
                                         int num_planes) {
   FilterFrameCtxt *ctxt = lr_ctxt->ctxt;
   uint16_t *luma = NULL;
-  uint16_t *luma_buf;
+  uint16_t *luma_buf = NULL;
   const YV12_BUFFER_CONFIG *dgd = &cm->cur_frame->buf;
   int luma_stride = dgd->widths[1] + 2 * WIENERNS_UV_BRD;
-  luma_buf = wienerns_copy_luma_with_virtual_lines(cm, &luma);
-  assert(luma_buf != NULL);
 
   for (int plane = 0; plane < num_planes; ++plane) {
     if (cm->rst_info[plane].frame_restoration_type == RESTORE_NONE) continue;
@@ -2110,6 +2119,13 @@ static void foreach_rest_unit_in_planes(AV2LrStruct *lr_ctxt, AV2_COMMON *cm,
     ctxt[plane].plane = plane;
     ctxt[plane].base_qindex = cm->quant_params.base_qindex;
     const int is_uv = (plane != AVM_PLANE_Y);
+    // The downsampled luma is only used by the chroma planes. The frame is
+    // not written before av2_loop_restoration_copy_planes(), so building it
+    // after the luma plane is filtered gives the same result.
+    if (is_uv && luma_buf == NULL) {
+      luma_buf = wienerns_copy_luma_with_virtual_lines(cm, &luma);
+      assert(luma_buf != NULL);
+    }
     ctxt[plane].luma = is_uv ? luma : NULL;
     ctxt[plane].luma_stride = is_uv ? luma_stride : -1;
     ctxt[plane].tskip = cm->mi_params.tx_skip[plane];
@@ -2397,8 +2413,17 @@ static void for_each_restoration_unit(RestorationTileLimits *limits,
   const int procunit_width = RESTORATION_PROC_UNIT_SIZE >> ss_x;
   const int enable_pcwiener_buffers =
       unit_rtype == RESTORE_PC_WIENER || unit_rtype == RESTORE_WIENER_NONSEP;
+  // The line buffers are only read by apply_pc_wiener_highbd(): when filtering
+  // with PC-Wiener, or when Wiener-NS needs the multi-class classification.
+  const int alloc_pcwiener_buffers =
+      unit_rtype == RESTORE_PC_WIENER ||
+      (unit_rtype == RESTORE_WIENER_NONSEP && tmp_rui.compute_classification &&
+       tmp_rui.wienerns_info.num_classes > 1);
 
-  PcwienerBuffers pc_wiener_buffers = { 0 };
+  PcwienerBuffers pc_wiener_buffers;
+  if (alloc_pcwiener_buffers) {
+    memset(&pc_wiener_buffers, 0, sizeof(pc_wiener_buffers));
+  }
   tmp_rui.pcwiener_buffers = &pc_wiener_buffers;
   const uint8_t *tskip_in_ru = NULL;
   uint8_t *wiener_class_id_in_ru = NULL;
@@ -2410,6 +2435,8 @@ static void for_each_restoration_unit(RestorationTileLimits *limits,
         tmp_rui.wiener_class_id +
         (limits->v_start >> MI_SIZE_LOG2) * tmp_rui.wiener_class_id_stride +
         (limits->h_start >> MI_SIZE_LOG2);
+  }
+  if (alloc_pcwiener_buffers) {
     allocate_pcwiener_line_buffers(procunit_width, &pc_wiener_buffers);
   }
 
@@ -2506,7 +2533,7 @@ static void for_each_restoration_unit(RestorationTileLimits *limits,
           tile_boundary_left, tile_boundary_right);
     }
   }
-  if (enable_pcwiener_buffers) free_pcwiener_line_buffers(&pc_wiener_buffers);
+  if (alloc_pcwiener_buffers) free_pcwiener_line_buffers(&pc_wiener_buffers);
 }
 
 // Loop over tile width in steps of LRU size. Further, pass the LRU width to

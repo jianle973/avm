@@ -372,6 +372,9 @@ void av2_cdef_filter_fb(uint8_t *dst8, uint16_t *dst16, int dstride,
     // Luma lossless block is already handled when dlist is generated in
     // av2_cdef_compute_sb_list
     if (pli != AVM_PLANE_Y && dlist[bi].chroma_lossless) {
+      // When the frame is filtered in place (dirinit == NULL), 'in' holds a
+      // copy of the still unmodified frame pixels, so the copy is a no-op.
+      if (!dirinit) continue;
       copy_cdef_pixels(
           &dst16[dirinit ? bi << (bw_log2 + bh_log2)
                          : (by << bh_log2) * dstride + (bx << bw_log2)],
@@ -382,6 +385,9 @@ void av2_cdef_filter_fb(uint8_t *dst8, uint16_t *dst16, int dstride,
       const int t =
           (pli ? pri_strength : adjust_strength(pri_strength, var[by][bx]));
       const int strength_index = (sec_strength == 0) | ((t == 0) << 1);
+      // Without primary and secondary filtering the block is copied
+      // unchanged, which is a no-op when the frame is filtered in place.
+      if (!dirinit && strength_index == 3) continue;
       cdef_filter_fn[strength_index](
           &dst16[dirinit ? bi << (bw_log2 + bh_log2)
                          : (by << bh_log2) * dstride + (bx << bw_log2)],

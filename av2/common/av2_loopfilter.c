@@ -674,10 +674,12 @@ static TX_SIZE set_lpf_parameters(
           const unsigned int hor_sb_size = block_size_wide[superblock_size];
           int vert_tile_edge = 0;
 
-          for (int i = 1; i < cm->tiles.cols; ++i) {
-            if ((cm->tiles.col_start_sb[i] * hor_sb_size == coord) &&
-                (VERT_EDGE == edge_dir)) {
-              vert_tile_edge = 1;
+          if (VERT_EDGE == edge_dir) {
+            for (int i = 1; i < cm->tiles.cols; ++i) {
+              if (cm->tiles.col_start_sb[i] * hor_sb_size == coord) {
+                vert_tile_edge = 1;
+                break;
+              }
             }
           }
 

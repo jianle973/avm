@@ -711,6 +711,14 @@ typedef struct AV2Decoder {
    * Number of entries allocated in gdf_rows and gdf_jobs
    */
   int gdf_rows_size;
+  /*!
+   * CCSO input: padded copy of the deblocked luma, kept across frames
+   */
+  uint16_t *ccso_ext_rec_y;
+  /*!
+   * Number of samples allocated in ccso_ext_rec_y
+   */
+  size_t ccso_ext_rec_y_size;
 } AV2Decoder;
 
 // Returns 0 on success. Sets pbi->common.error.error_code to a nonzero error

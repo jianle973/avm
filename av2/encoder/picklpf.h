@@ -146,6 +146,9 @@ struct AV2_COMP;
  */
 void av2_pick_filter_level(const struct yv12_buffer_config *sd,
                            struct AV2_COMP *cpi, LPF_PICK_METHOD method);
+// Decides whether the TIP frame is deblocked. On return the TIP frame holds
+// the filtered output if cm->lf.apply_deblocking_filter_tip is set, and the
+// unfiltered frame otherwise.
 void search_tip_filter_level(AV2_COMP *cpi, struct AV2Common *cm);
 #ifdef __cplusplus
 }  // extern "C"

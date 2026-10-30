@@ -9788,14 +9788,26 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
       const int dst_stride = cm->cur_frame->buf.y_stride;
       const uint16_t *rec_y = cm->cur_frame->buf.y_buffer;
       const int ccso_stride_ext = pic_width + (CCSO_PADDING_SIZE << 1);
-      ext_rec_y = avm_malloc(sizeof(*ext_rec_y) *
-                             (pic_height + (CCSO_PADDING_SIZE << 1)) *
-                             (pic_width + (CCSO_PADDING_SIZE << 1)));
+      const size_t ext_rec_y_size =
+          (size_t)ccso_stride_ext * (pic_height + (CCSO_PADDING_SIZE << 1));
+      // The buffer is kept across frames and only made again when it has to
+      // grow; it is freed in av2_decoder_remove().
+      if (ext_rec_y_size > pbi->ccso_ext_rec_y_size) {
+        avm_free(pbi->ccso_ext_rec_y);
+        pbi->ccso_ext_rec_y = NULL;
+        pbi->ccso_ext_rec_y_size = 0;
+        CHECK_MEM_ERROR(
+            cm, pbi->ccso_ext_rec_y,
+            avm_malloc(sizeof(*pbi->ccso_ext_rec_y) * ext_rec_y_size));
+        pbi->ccso_ext_rec_y_size = ext_rec_y_size;
+      }
+      ext_rec_y = pbi->ccso_ext_rec_y;
+      uint16_t *ext_rec_y_row =
+          ext_rec_y + CCSO_PADDING_SIZE * ccso_stride_ext + CCSO_PADDING_SIZE;
       for (int r = 0; r < pic_height; ++r) {
-        for (int c = 0; c < pic_width; ++c) {
-          ext_rec_y[(r + CCSO_PADDING_SIZE) * ccso_stride_ext + c +
-                    CCSO_PADDING_SIZE] = rec_y[r * dst_stride + c];
-        }
+        memcpy(ext_rec_y_row, rec_y, pic_width * sizeof(*rec_y));
+        ext_rec_y_row += ccso_stride_ext;
+        rec_y += dst_stride;
       }
       extend_ccso_border(&cm->cur_frame->buf, ext_rec_y, CCSO_PADDING_SIZE);
     }
@@ -9846,7 +9858,6 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
         } else {
           ccso_frame(&cm->cur_frame->buf, cm, xd, ext_rec_y);
         }
-        avm_free(ext_rec_y);
       }
 #if CONFIG_MISMATCH_DEBUG
       mismatch_check_frame(&pbi->common.cur_frame->buf,
@@ -9888,7 +9899,8 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
                              cm->current_frame.display_order_hint, num_planes,
                              4);
 #endif
-        gdf_free_guided_frame(cm);
+        // The guided frame buffer is kept for the next frame and freed in
+        // av2_decoder_remove().
       }
 
     } else {

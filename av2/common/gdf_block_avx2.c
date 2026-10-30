@@ -355,8 +355,6 @@ void gdf_inference_unit_avx2(
     bias = gdf_inter_bias_table[ref_dst_idx - 1][qp_idx];
     gdf_table = gdf_inter_error_table[ref_dst_idx - 1][qp_idx];
   }
-  __m256i (*gdf_get_idx_func)(__m256i *, __m256i *, __m256i *) =
-      is_intra ? gdf_intra_get_idx : gdf_inter_get_idx;
 
   gdf_load_bias_reg(bias_reg0, bias);
   gdf_load_bias_reg(bias_reg1, bias + GDF_NET_INP_GRD_NUM);
@@ -496,13 +494,13 @@ void gdf_inference_unit_avx2(
       gdf_quant_feature_reg(out_reg21, neg_mask, zero_reg, scale_value,
                             half_value, lut_shift, idx_min_reg, idx_max_reg);
 
-      __m256i lut_idx_odd =
-          gdf_get_idx_func(&out_reg00, &out_reg10, &out_reg20);
-      _mm256_add_epi32(_mm256_add_epi32(_mm256_slli_epi32(out_reg00, 8),
-                                        _mm256_slli_epi32(out_reg10, 4)),
-                       out_reg20);
-      __m256i lut_idx_even =
-          gdf_get_idx_func(&out_reg01, &out_reg11, &out_reg21);
+      // Direct calls (is_intra is loop invariant) so the helpers inline.
+      const __m256i lut_idx_odd =
+          is_intra ? gdf_intra_get_idx(&out_reg00, &out_reg10, &out_reg20)
+                   : gdf_inter_get_idx(&out_reg00, &out_reg10, &out_reg20);
+      const __m256i lut_idx_even =
+          is_intra ? gdf_intra_get_idx(&out_reg01, &out_reg11, &out_reg21)
+                   : gdf_inter_get_idx(&out_reg01, &out_reg11, &out_reg21);
 
       __m256i sub_idx_mask = _mm256_set1_epi32(0x3);
       __m256i v_odd = _mm256_i32gather_epi32(

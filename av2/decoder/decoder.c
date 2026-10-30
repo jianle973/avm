@@ -443,6 +443,10 @@ void av2_decoder_remove(AV2Decoder *pbi) {
   gdf_free_stripe_buf(&pbi->gdf_stripe_buf);
   avm_free(pbi->gdf_rows);
   avm_free(pbi->gdf_jobs);
+  gdf_free_guided_frame(&pbi->common);
+  avm_free(pbi->ccso_ext_rec_y);
+  pbi->ccso_ext_rec_y = NULL;
+  pbi->ccso_ext_rec_y_size = 0;
   av2_dec_free_cb_buf(pbi);
 #if CONFIG_ACCOUNTING
   avm_accounting_clear(&pbi->accounting);

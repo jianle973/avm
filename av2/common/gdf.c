@@ -191,22 +191,35 @@ void gdf_copy_guided_frame(AV2_COMMON *cm) {
                                 // 16: AVX2 vector length
   cm->gdf_info.inp_stride = input_stride;
 
-  cm->gdf_info.inp_pad_ptr =
-      (uint16_t *)avm_memalign(32, (top_buf + rec_height + bot_buf + 4) *
-                                       input_stride * sizeof(uint16_t));
-  for (int i = top_buf; i < top_buf + rec_height; i++) {
-    memcpy(
-        cm->gdf_info.inp_pad_ptr + i * input_stride + GDF_TEST_EXTRA_HOR_BORDER,
-        cm->cur_frame->buf.buffers[AVM_PLANE_Y] + (i - top_buf) * rec_stride,
-        sizeof(uint16_t) * rec_width);
-    if (cm->cur_frame->buf.bit_depth > GDF_TEST_INP_PREC) {
-      const unsigned int diff_bit_depth =
-          cm->cur_frame->buf.bit_depth - GDF_TEST_INP_PREC;
-      uint16_t *cur_line = cm->gdf_info.inp_pad_ptr + i * input_stride +
-                           GDF_TEST_EXTRA_HOR_BORDER;
+  // The buffer is kept across frames (freed in gdf_free_guided_frame()) and
+  // only made again when it has to grow.
+  const size_t inp_pad_size = (size_t)(top_buf + rec_height + bot_buf + 4) *
+                              input_stride * sizeof(uint16_t);
+  if (cm->gdf_info.inp_pad_ptr == NULL ||
+      cm->gdf_info.inp_pad_size < inp_pad_size) {
+    gdf_free_guided_frame(cm);
+    CHECK_MEM_ERROR(cm, cm->gdf_info.inp_pad_ptr,
+                    (uint16_t *)avm_memalign(32, inp_pad_size));
+    cm->gdf_info.inp_pad_size = inp_pad_size;
+  }
+  const uint16_t *src_line = cm->cur_frame->buf.buffers[AVM_PLANE_Y];
+  uint16_t *dst_line =
+      cm->gdf_info.inp_pad_ptr + top_buf * input_stride + GDF_TEST_EXTRA_HOR_BORDER;
+  if (cm->cur_frame->buf.bit_depth > GDF_TEST_INP_PREC) {
+    const unsigned int diff_bit_depth =
+        cm->cur_frame->buf.bit_depth - GDF_TEST_INP_PREC;
+    for (int i = 0; i < rec_height; i++) {
       for (int j = 0; j < rec_width; j++) {
-        cur_line[j] >>= diff_bit_depth;
+        dst_line[j] = src_line[j] >> diff_bit_depth;
       }
+      src_line += rec_stride;
+      dst_line += input_stride;
+    }
+  } else {
+    for (int i = 0; i < rec_height; i++) {
+      memcpy(dst_line, src_line, sizeof(uint16_t) * rec_width);
+      src_line += rec_stride;
+      dst_line += input_stride;
     }
   }
   cm->gdf_info.inp_ptr = cm->gdf_info.inp_pad_ptr + top_buf * input_stride +
@@ -424,6 +437,9 @@ void gdf_load_stripe(const AV2_COMMON *cm, GdfStripeBuf *sb, int i_min,
 
 void gdf_free_guided_frame(AV2_COMMON *cm) {
   avm_free(cm->gdf_info.inp_pad_ptr);
+  cm->gdf_info.inp_pad_ptr = NULL;
+  cm->gdf_info.inp_ptr = NULL;
+  cm->gdf_info.inp_pad_size = 0;
 }
 
 int gdf_get_block_idx(const AV2_COMMON *cm, int y_h, int y_w) {
@@ -623,6 +639,15 @@ void gdf_filter_job(AV2_COMMON *cm, GdfStripeBuf *sb, const GdfBlockRow *rows,
   gdf_get_job_cols(cm, job, &job_j_min, &job_j_max);
   for (int r = job->row0; r < job->row0 + job->num_rows; ++r) {
     const GdfBlockRow *row = &rows[r];
+    // With block-level on/off, a block row without any enabled block in this
+    // job writes nothing: skip its stripe copies and boundary setup.
+    if (gi->gdf_mode != 1) {
+      int any_block_on = 0;
+      for (int blk = job->blk0; blk < job->blk1 && !any_block_on; ++blk) {
+        any_block_on = gi->gdf_block_flags[row->blk_idx0 + blk];
+      }
+      if (!any_block_on) continue;
+    }
     const int tile_row = row->tile_row;
     TileInfo tile_info;
     av2_tile_init(&tile_info, cm, tile_row, 0);
